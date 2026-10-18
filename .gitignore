@@ -1,0 +1,11 @@
+.venv/
+.venv.invalid-*/
+__pycache__/
+.test-tmp/
+*.pyc
+.env
+output/
+work/
+models/
+logs/
+environment-report.json
