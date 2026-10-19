@@ -8,12 +8,12 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
-import re
 from importlib import metadata
 from pathlib import Path
 from tempfile import mkstemp
@@ -29,6 +29,18 @@ REQUIREMENTS = ROOT / "requirements.txt"
 REPORT_PATH = ROOT / "environment-report.json"
 LOG_DIR = ROOT / "logs"
 MIN_PYTHON = (3, 10)
+DOTENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def parse_dotenv_value(value: str) -> str:
+    value = value.strip()
+    if value[:1] in {"'", '"'}:
+        quote = value[0]
+        closing = value.find(quote, 1)
+        if closing >= 0:
+            return value[1:closing]
+        return value[1:]
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -52,7 +64,11 @@ def read_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.is_file():
         return values
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read environment file {path}: {exc}") from exc
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -61,10 +77,9 @@ def read_dotenv(path: Path) -> dict[str, str]:
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", "\""}:
-            value = value[1:-1]
-        values[key.strip()] = value
+        key = key.strip()
+        if DOTENV_KEY_RE.match(key):
+            values[key] = parse_dotenv_value(value)
     return values
 
 
@@ -121,7 +136,7 @@ def ensure_venv(no_venv: bool) -> None:
     env["PYTHONUTF8"] = "1"
     args = [str(py), str(Path(__file__).resolve()), *sys.argv[1:]]
     print("[bootstrap] Re-entering the project virtual environment")
-    result = subprocess.run(args, env=env)
+    result = subprocess.run(args, env=env, check=False)
     raise SystemExit(result.returncode)
 
 
@@ -134,6 +149,7 @@ def run_capture(command: list[str], timeout: int = 20) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            check=False,
         )
         output = (result.stdout or "") + (result.stderr or "")
         return result.returncode, output.strip()
@@ -318,7 +334,7 @@ def rerun_current_process() -> None:
     env["PYTHONUTF8"] = "1"
     env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     args = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
-    result = subprocess.run(args, env=env)
+    result = subprocess.run(args, env=env, check=False)
     raise SystemExit(result.returncode)
 
 
@@ -342,10 +358,20 @@ def run_logged(
             errors="replace",
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log.write(line)
-        return process.wait()
+        try:
+            for line in process.stdout:
+                print(line, end="")
+                log.write(line)
+            return process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            process.stdout.close()
 
 
 def pip_install(
@@ -393,10 +419,14 @@ def cuda_library_dirs() -> list[Path]:
         nvidia = root / "nvidia"
         if not nvidia.exists():
             continue
-        for child in nvidia.iterdir():
+        try:
+            children = list(nvidia.iterdir())
+        except OSError:
+            continue
+        for child in children:
             for name in ("bin", "lib", "lib64"):
                 path = child / name
-                if path.exists():
+                if path.exists() and path not in candidates:
                     candidates.append(path)
     return candidates
 
@@ -429,6 +459,7 @@ def cuda_usable(env: dict[str, str]) -> bool:
             encoding="utf-8",
             errors="replace",
             timeout=60,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"[bootstrap] CUDA check failed: {exc}")
@@ -550,7 +581,11 @@ def main() -> int:
 
     os.chdir(ROOT)
     args, forwarded = parse_args(sys.argv[1:])
-    dotenv = read_dotenv(ROOT / ".env")
+    try:
+        dotenv = read_dotenv(ROOT / ".env")
+    except ValueError as exc:
+        print(f"[bootstrap] {exc}")
+        return 2
     try:
         auto_install_cuda = parse_bool(
             os.environ.get("AUTO_INSTALL_CUDA", "").strip()
@@ -571,11 +606,14 @@ def main() -> int:
         report = base_environment_report()
         report["settings"] = {"auto_install_cuda": auto_install_cuda}
         print_report(report)
-        atomic_write_text(
-            REPORT_PATH,
-            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        )
-        print(f"Report: {REPORT_PATH}")
+        try:
+            atomic_write_text(
+                REPORT_PATH,
+                json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            )
+            print(f"Report: {REPORT_PATH}")
+        except OSError as exc:
+            print(f"[bootstrap] Warning: could not write report: {exc}")
         return 0
 
     report = base_environment_report()
@@ -598,7 +636,11 @@ def main() -> int:
 
     command = [sys.executable, str(ROOT / "extract_video.py"), *forwarded]
     print("\n[bootstrap] Starting video extraction")
-    result = subprocess.run(command, cwd=ROOT, env=env)
+    try:
+        result = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    except OSError as exc:
+        print(f"[bootstrap] Could not start the extractor: {exc}")
+        return 4
     return result.returncode
 
 

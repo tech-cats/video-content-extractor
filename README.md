@@ -6,6 +6,7 @@
 
 - Windows 10/11、macOS、常见 x86_64/ARM64 Linux
 - Python 3.10 或更高版本；启动器会尝试自动安装缺失的 Python
+- 推荐 Python 3.12；启动器会优先选择兼容性更稳定的版本，并尝试安装缺失的 Python
 - 优先使用站点公开字幕；没有字幕时使用 faster-whisper 做语音识别
 - NVIDIA 显卡可用时自动尝试 GPU；CUDA 不可用时自动回退 CPU
 - yt-dlp 支持的公开视频页面，以及本地音视频或 SRT/VTT 文件
@@ -17,7 +18,7 @@
 2. 在 Windows 上运行：
 
 ```powershell
-cd "C:\Users\39232\Desktop\video-content-extractor"
+cd "你的项目目录"
 .\run.ps1
 ```
 
@@ -89,11 +90,14 @@ AUTO_INSTALL_CUDA=true
 
 默认输出到 `output/<视频标题>/`：
 
+如果两个不同视频标题相同，第二个结果会使用带视频 ID 和来源哈希的目录名，避免覆盖已有输出。
+
 - `summary.md`：一句话概括、主要内容、分段时间线、关键词
 - `transcript.txt`：便于阅读的纯文本转写
 - `transcript.srt`：标准 SRT 字幕
 - `transcript.vtt`：WebVTT 字幕
 - `transcript.json`：包含元数据、时间戳和转写片段的完整结构化结果
+- `.extractor.json`：记录输出来源与完成状态，用于安全复用或隔离同名目录
 
 不配置 LLM 时使用本地抽取式摘要，完全不依赖额外 API。若需要语义质量更高的摘要，可以配置任意 OpenAI Chat Completions 兼容接口：
 
@@ -114,12 +118,16 @@ LLM_MODEL=你的模型名
 - 安装失败会保留详细日志并给出可操作错误
 - GPU 转写在任一阶段失败时自动重建 CPU 模型并重新执行
 - 优先使用已有字幕，减少下载量与转写时间
-- 每次下载前清理旧字幕，并拒绝复用本次下载之外的旧媒体文件
+- 媒体缓存按视频来源隔离；零字节文件会被清理，完整缓存可安全复用
 - 下载支持断点续传和重试
 - 转写过程每 15 秒输出进度，并写入 `transcript.partial.jsonl` 作为中间记录
 - 默认只下载音频，不保存完整视频，降低磁盘占用
 - 下载的临时音频在转写成功或失败后都会清理，除非设置 `KEEP_AUDIO=true`
 - 字幕时间轴会过滤倒序和零长度片段，输出文件使用临时文件原子替换
+- SRT/VTT 可处理缺少空行、乱序时间轴和非法时间戳；VTT 标签会被清理
+- 文件名同时限制字符数和 UTF-8 字节数，兼容 Linux、macOS 与 Windows 路径限制
+- 不同来源的同名视频会隔离输出目录，不会互相覆盖
+- LLM 请求限制响应大小，并拒绝会把 API 密钥带到其他站点的跨域重定向
 - LLM 长文本按固定上限切块，超长单行也不会绕过限制
 - 摘要失败不会丢失已生成的转写稿
 
@@ -134,5 +142,12 @@ LLM_MODEL=你的模型名
 
 ```powershell
 python extract_video.py --self-test
+python -m unittest discover -s tests -v
+```
+
+如果源码目录只读，可把测试临时目录指向可写位置：
+
+```powershell
+$env:VCE_TEST_TMP = "$env:TEMP\video-extractor-tests"
 python -m unittest discover -s tests -v
 ```

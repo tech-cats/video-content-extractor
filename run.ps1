@@ -20,9 +20,12 @@ $pythonExe = $null
 $pythonPrefix = @()
 
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    if (Test-PythonCommand -Exe "py" -Prefix @("-3")) {
-        $pythonExe = "py"
-        $pythonPrefix = @("-3")
+    foreach ($version in @("3.12", "3.11", "3.13", "3.10", "3")) {
+        if (Test-PythonCommand -Exe "py" -Prefix @("-$version")) {
+            $pythonExe = "py"
+            $pythonPrefix = @("-$version")
+            break
+        }
     }
 }
 

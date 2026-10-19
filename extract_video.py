@@ -17,10 +17,10 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from hashlib import sha256
+from pathlib import Path
 from tempfile import mkstemp
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 try:
@@ -36,6 +36,10 @@ TIME_RE = re.compile(
     r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})"
 )
 ASCII_WORD_RE = re.compile(r"[A-Za-z0-9]")
+MAX_FILENAME_CHARS = 120
+MAX_FILENAME_BYTES = 180
+OUTPUT_MANIFEST = ".extractor.json"
+DOTENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -72,7 +76,6 @@ STOP_TERMS = {
     "关于",
     "同时",
     "其中",
-    "在这",
     "在这",
     "有着",
     "能够",
@@ -152,11 +155,26 @@ def parse_bool(value: str | bool | None, default: bool = False) -> bool:
     raise ValueError(f"Invalid boolean value: {value}")
 
 
+def parse_dotenv_value(value: str) -> str:
+    value = value.strip()
+    if value[:1] in {"'", '"'}:
+        quote = value[0]
+        closing = value.find(quote, 1)
+        if closing >= 0:
+            return value[1:closing]
+        return value[1:]
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
+
 def load_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read environment file {path}: {exc}") from exc
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -166,10 +184,9 @@ def load_env(path: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key] = value
+        if not DOTENV_KEY_RE.match(key):
+            continue
+        values[key] = parse_dotenv_value(value)
     return values
 
 
@@ -225,16 +242,24 @@ def parse_args(argv: list[str], env: dict[str, str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _truncate_filename(value: str, max_bytes: int = MAX_FILENAME_BYTES) -> str:
+    value = value[:MAX_FILENAME_CHARS]
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) > max_bytes:
+        value = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return value.rstrip(" .")
+
+
 def safe_filename(value: str, fallback: str = "video") -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
-    value = value[:120].rstrip(" .")
+    value = _truncate_filename(value)
     if not value:
-        value = fallback
+        value = _truncate_filename(fallback) or "video"
     stem = value.split(".", 1)[0].rstrip(" .").upper()
     if stem in WINDOWS_RESERVED:
-        value = f"_{value}"
-    return value
+        value = "_" + value
+    return _truncate_filename(value)
 
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -283,11 +308,14 @@ def clean_text(value: str) -> str:
 
 
 def parse_timestamp(value: str) -> float:
-    value = value.replace(",", ".")
-    parts = value.split(":")
+    parts = value.replace(",", ".").split(":")
+    if len(parts) not in {2, 3}:
+        raise ValueError(f"Invalid subtitle timestamp: {value}")
     seconds = float(parts[-1])
-    minutes = int(parts[-2]) if len(parts) >= 2 else 0
-    hours = int(parts[-3]) if len(parts) >= 3 else 0
+    minutes = int(parts[-2])
+    hours = int(parts[-3]) if len(parts) == 3 else 0
+    if minutes >= 60 or seconds >= 60 or minutes < 0 or seconds < 0 or hours < 0:
+        raise ValueError(f"Invalid subtitle timestamp: {value}")
     return hours * 3600 + minutes * 60 + seconds
 
 
@@ -310,37 +338,64 @@ def compact_timestamp(seconds: float) -> str:
 
 
 def parse_subtitle_text(content: str) -> list[Segment]:
-    content = content.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = re.split(r"\n\s*\n", content)
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").splitlines()
     segments: list[Segment] = []
     previous = ""
-    for block in blocks:
-        lines = [line.strip("\ufeff ") for line in block.splitlines() if line.strip()]
-        if not lines:
-            continue
-        time_index = next((i for i, line in enumerate(lines) if TIME_RE.search(line)), -1)
-        if time_index < 0:
-            continue
-        match = TIME_RE.search(lines[time_index])
+    index = 0
+    while index < len(lines):
+        match = TIME_RE.search(lines[index].strip("\ufeff "))
         if not match:
+            index += 1
             continue
-        start = parse_timestamp(match.group("start"))
-        end = parse_timestamp(match.group("end"))
+        try:
+            start = parse_timestamp(match.group("start"))
+            end = parse_timestamp(match.group("end"))
+        except (TypeError, ValueError):
+            index += 1
+            continue
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            index += 1
             continue
-        text = join_text_fragments(lines[time_index + 1 :])
+
+        index += 1
+        text_lines: list[str] = []
+        while index < len(lines):
+            candidate = lines[index].strip()
+            if not candidate or TIME_RE.search(candidate):
+                break
+            text_lines.append(lines[index])
+            index += 1
+
+        text = clean_text(join_text_fragments(text_lines))
         signature = re.sub(r"\s+", "", text).casefold()
         if not text or signature == previous or text == "WEBVTT":
             continue
         previous = signature
-        segments.append(
-            Segment(
-                start=start,
-                end=end,
-                text=text,
-            )
-        )
+        segments.append(Segment(start=start, end=end, text=text))
+    segments.sort(key=lambda segment: (segment.start, segment.end))
     return segments
+
+
+def normalize_segments(segments: list[Segment], log_invalid: bool = False) -> list[Segment]:
+    normalized: list[Segment] = []
+    for segment in segments:
+        try:
+            start = float(segment.start)
+            end = float(segment.end)
+        except (TypeError, ValueError):
+            if log_invalid:
+                log(f"Skipping non-numeric transcript segment: {segment!r}")
+            continue
+        text = clean_text(segment.text) if isinstance(segment.text, str) else ""
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            if log_invalid:
+                log(f"Skipping invalid transcript segment: {segment.start} -> {segment.end}")
+            continue
+        start = max(0.0, start)
+        if text and end > start:
+            normalized.append(Segment(start, end, text))
+    normalized.sort(key=lambda segment: (segment.start, segment.end))
+    return normalized
 
 
 def write_transcript_outputs(
@@ -351,16 +406,7 @@ def write_transcript_outputs(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    normalized_segments: list[Segment] = []
-    for segment in segments:
-        start = float(segment.start)
-        end = float(segment.end)
-        text = clean_text(segment.text) if isinstance(segment.text, str) else ""
-        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
-            log(f"Skipping invalid transcript segment: {segment.start} -> {segment.end}")
-            continue
-        if text:
-            normalized_segments.append(Segment(max(0.0, start), end, text))
+    normalized_segments = normalize_segments(segments, log_invalid=True)
     if not normalized_segments:
         raise ValueError("Cannot write an empty transcript")
 
@@ -374,8 +420,10 @@ def write_transcript_outputs(
         )
         vtt_parts.extend(
             [
-                f"{format_timestamp(segment.start, vtt=True)} --> "
-                f"{format_timestamp(segment.end, vtt=True)}",
+                (
+                    f"{format_timestamp(segment.start, vtt=True)} --> "
+                    f"{format_timestamp(segment.end, vtt=True)}"
+                ),
                 segment.text,
                 "",
             ]
@@ -423,6 +471,67 @@ def write_transcript_outputs(
     }
     atomic_write_text(
         output_dir / "transcript.json",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def metadata_source_hash(metadata: VideoMetadata) -> str:
+    return sha256(metadata.source.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _output_manifest_matches(path: Path, metadata: VideoMetadata) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("source") == metadata.source
+        and payload.get("video_id", "") == metadata.video_id
+    )
+
+
+def choose_output_directory(output_root: Path, metadata: VideoMetadata) -> Path:
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError(f"OUTPUT_DIR is not a directory: {output_root}")
+    base = output_root / safe_filename(metadata.title)
+    source_tag = metadata.video_id.strip() or "media"
+    collision = output_root / safe_filename(
+        f"{metadata.title}-{source_tag}-{metadata_source_hash(metadata)}"
+    )
+    output_names = {
+        "summary.md",
+        "transcript.txt",
+        "transcript.srt",
+        "transcript.vtt",
+        "transcript.json",
+    }
+    for candidate in (base, collision):
+        if not candidate.exists():
+            return candidate
+        if not candidate.is_dir():
+            continue
+        manifest = candidate / OUTPUT_MANIFEST
+        if manifest.is_file() and _output_manifest_matches(manifest, metadata):
+            return candidate
+        if not manifest.exists() and not any(
+            (candidate / name).exists() for name in output_names
+        ):
+            return candidate
+    return collision
+
+
+def write_output_manifest(output_dir: Path, metadata: VideoMetadata, status: str) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "title": metadata.title,
+        "source": metadata.source,
+        "video_id": metadata.video_id,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    atomic_write_text(
+        output_dir / OUTPUT_MANIFEST,
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
 
@@ -576,8 +685,10 @@ def summarize_locally(metadata: VideoMetadata, segments: list[Segment]) -> str:
             "",
             "## 说明",
             "",
-            "本摘要由本地抽取式算法生成，优先保留高频主题和时间顺序；"
-            "如需更强的语义概括，可在 `.env` 中配置兼容的 LLM API。",
+            (
+                "本摘要由本地抽取式算法生成，优先保留高频主题和时间顺序；"
+                "如需更强的语义概括，可在 `.env` 中配置兼容的 LLM API。"
+            ),
             "",
         ]
     )
@@ -621,6 +732,32 @@ def split_text(text: str, limit: int = 12000) -> list[str]:
     return chunks
 
 
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        original = urlsplit(request.full_url)
+        redirected = urlsplit(new_url)
+        if (original.scheme, original.netloc) != (
+            redirected.scheme,
+            redirected.netloc,
+        ):
+            raise urllib.error.URLError(
+                "Refusing an LLM redirect to a different origin"
+            )
+        return super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+
+
+def chat_completions_endpoint(base_url: str) -> str:
+    parsed = urlsplit(base_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid LLM_BASE_URL: {base_url}")
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
 def llm_chat(
     api_key: str,
     base_url: str,
@@ -628,12 +765,14 @@ def llm_chat(
     prompt: str,
     timeout: int,
 ) -> str:
-    endpoint = base_url.rstrip("/")
-    if not endpoint.endswith("/chat/completions"):
-        endpoint += "/chat/completions"
-    parsed_endpoint = urlparse(endpoint)
-    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
-        raise ValueError(f"Invalid LLM_BASE_URL: {base_url}")
+    endpoint = chat_completions_endpoint(base_url)
+    parsed_endpoint = urlsplit(endpoint)
+    if parsed_endpoint.scheme == "http" and parsed_endpoint.hostname not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        log("Warning: the LLM endpoint uses plain HTTP; the API key is not encrypted in transit")
 
     payload = json.dumps(
         {
@@ -665,10 +804,14 @@ def llm_chat(
         method="POST",
     )
     context = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        _SameOriginRedirectHandler(),
+    )
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            with opener.open(request, timeout=timeout) as response:
                 raw_response = response.read(8 * 1024 * 1024 + 1)
             if len(raw_response) > 8 * 1024 * 1024:
                 raise ValueError("LLM response exceeded the 8 MiB safety limit")
@@ -765,13 +908,16 @@ def first_entry(info: dict[str, object]) -> dict[str, object]:
     if not isinstance(info, dict):
         raise RuntimeError("yt-dlp returned no video information")
     entries = info.get("entries")
-    if entries:
+    if entries is not None:
         if isinstance(entries, dict):
             entries = entries.values()
         first = next((entry for entry in entries if isinstance(entry, dict)), None)
         if first is None:
             raise RuntimeError("The playlist or URL contained no downloadable video")
-        return first
+        info = first
+    live_status = str(info.get("live_status") or "")
+    if info.get("is_live") or live_status in {"is_live", "is_upcoming"}:
+        raise RuntimeError("Live or upcoming streams are not supported. Use a completed recording.")
     return info
 
 
@@ -904,7 +1050,7 @@ def download_subtitle(
             "writesubtitles": not automatic,
             "writeautomaticsub": automatic,
             "subtitleslangs": [language],
-            "subtitlesformat": "srt/vtt/best",
+            "subtitlesformat": "srt/vtt",
             "outtmpl": str(work_dir / "source.%(ext)s"),
         }
     )
@@ -946,7 +1092,8 @@ def find_ffmpeg() -> str | None:
     try:
         import imageio_ffmpeg  # type: ignore
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
+        executable = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        return str(executable) if executable.is_file() else None
     except Exception:
         return None
 
@@ -954,7 +1101,12 @@ def find_ffmpeg() -> str | None:
 def download_media(url: str, settings: Settings, work_dir: Path) -> tuple[Path, dict[str, object]]:
     yt_dlp = import_ytdlp()
     work_dir.mkdir(parents=True, exist_ok=True)
-    started_at = time.time()
+    for stale_path in work_dir.glob("media.*"):
+        try:
+            if stale_path.is_file() and stale_path.stat().st_size == 0:
+                stale_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     options = ytdlp_options(settings)
     options.update(
         {
@@ -980,11 +1132,17 @@ def download_media(url: str, settings: Settings, work_dir: Path) -> tuple[Path, 
         not in {".part", ".ytdl", ".json", ".srt", ".vtt", ".description"}
         and path.is_file()
         and path.stat().st_size > 0
-        and path.stat().st_mtime >= started_at - 2
     ]
     if not candidates:
         raise RuntimeError("Download completed but no current media file was found")
     return max(candidates, key=lambda path: path.stat().st_mtime), info
+
+
+def cuda_compute_type(types: set[str]) -> str:
+    for candidate in ("float16", "int8_float16", "float32"):
+        if candidate in types:
+            return candidate
+    return "float16"
 
 
 def detect_device(requested: str) -> tuple[str, str]:
@@ -994,26 +1152,19 @@ def detect_device(requested: str) -> tuple[str, str]:
         import ctranslate2  # type: ignore
 
         count = ctranslate2.get_cuda_device_count()
-        if count > 0:
-            types = ctranslate2.get_supported_compute_types("cuda")
-        else:
-            types = set()
+        types = (
+            set(ctranslate2.get_supported_compute_types("cuda"))
+            if count > 0
+            else set()
+        )
     except Exception:
         count = 0
         types = set()
 
-    if requested == "cuda" or (requested == "auto" and count > 0):
-        if "float16" in types:
-            return "cuda", "float16"
-        if "int8_float16" in types:
-            return "cuda", "int8_float16"
-        if "float32" in types:
-            return "cuda", "float32"
-        if requested == "cuda":
-            raise RuntimeError(
-                "CUDA was requested but no supported compute type is available. "
-                "Use --device cpu or repair the CUDA runtime."
-            )
+    if requested == "cuda":
+        return "cuda", cuda_compute_type(types)
+    if requested == "auto" and count > 0 and types:
+        return "cuda", cuda_compute_type(types)
     return "cpu", choose_compute_type("cpu")
 
 
@@ -1051,23 +1202,40 @@ def transcribe_audio(
     requested_device = settings.device.lower()
     if requested_device not in {"auto", "cpu", "cuda"}:
         raise ValueError("WHISPER_DEVICE must be auto, cpu, or cuda")
-    device, compute_type = detect_device(requested_device)
-    if settings.compute_type.lower() != "auto":
-        compute_type = settings.compute_type
-    model_name = settings.model
-    if model_name.lower() == "auto":
-        model_name = "large-v3" if device == "cuda" else "small"
+    device, detected_compute = detect_device(requested_device)
+    configured_compute = settings.compute_type.lower()
+    primary_compute = (
+        detected_compute if configured_compute == "auto" else configured_compute
+    )
+    if device == "cpu" and primary_compute in {"float16", "int8_float16", "bfloat16"}:
+        safe_compute = choose_compute_type("cpu")
+        log(
+            f"Compute type {primary_compute} is not suitable for CPU; using {safe_compute}"
+        )
+        primary_compute = safe_compute
 
-    attempts = [(device, compute_type)]
+    def model_for(attempt_device: str) -> str:
+        if settings.model.lower() != "auto":
+            return settings.model
+        return "large-v3" if attempt_device == "cuda" else "small"
+
+    attempts = [(device, primary_compute, model_for(device))]
     if device == "cuda":
-        attempts.append(("cpu", choose_compute_type("cpu")))
+        attempts.append(("cpu", choose_compute_type("cpu"), model_for("cpu")))
 
+    partial_path = work_dir / "transcript.partial.jsonl"
+    partial_path.unlink(missing_ok=True)
     last_error: Exception | None = None
-    for attempt_index, (attempt_device, attempt_compute) in enumerate(attempts, 1):
+    for attempt_index, (
+        attempt_device,
+        attempt_compute,
+        model_name,
+    ) in enumerate(attempts, 1):
         log(
             f"Loading Whisper model {model_name} for {attempt_device} "
             f"({attempt_compute}), attempt {attempt_index}/{len(attempts)}"
         )
+        model = None
         try:
             model = WhisperModel(
                 model_name,
@@ -1088,14 +1256,17 @@ def transcribe_audio(
             segments: list[Segment] = []
             started = time.monotonic()
             last_report = started
-            duration = float(getattr(info, "duration", 0.0) or 0.0)
-            partial_path = work_dir / "transcript.partial.jsonl"
+            duration = optional_duration(getattr(info, "duration", None)) or 0.0
             with partial_path.open("w", encoding="utf-8") as partial:
                 for raw_segment in segment_iterator:
-                    text = clean_text(raw_segment.text)
+                    text = clean_text(str(raw_segment.text or ""))
                     if not text:
                         continue
-                    segment = Segment(float(raw_segment.start), float(raw_segment.end), text)
+                    segment = Segment(
+                        float(raw_segment.start),
+                        float(raw_segment.end),
+                        text,
+                    )
                     segments.append(segment)
                     partial.write(json.dumps(asdict(segment), ensure_ascii=False) + "\n")
                     partial.flush()
@@ -1106,7 +1277,10 @@ def transcribe_audio(
                             if duration
                             else f"{len(segments)} segments"
                         )
-                        log(f"Transcription progress: {compact_timestamp(segment.end)} ({progress})")
+                        log(
+                            f"Transcription progress: "
+                            f"{compact_timestamp(segment.end)} ({progress})"
+                        )
                         last_report = now
             if not segments:
                 raise RuntimeError("The audio contained no recognizable speech")
@@ -1128,6 +1302,8 @@ def transcribe_audio(
                 log("CUDA is unavailable or incomplete; retrying with CPU")
             else:
                 break
+        finally:
+            del model
     raise RuntimeError(f"Transcription failed: {last_error}")
 
 
@@ -1188,8 +1364,8 @@ def resolve_local_input(explicit_value: str, url: str) -> Path | None:
 def work_directory_name(metadata: VideoMetadata) -> str:
     identity = metadata.video_id.strip()
     if not identity:
-        source_hash = sha256(metadata.source.encode("utf-8", errors="replace")).hexdigest()[:12]
-        identity = f"{metadata.title}-{source_hash}"
+        identity = metadata.title
+    identity = f"{identity}-{metadata_source_hash(metadata)[:8]}"
     return safe_filename(identity, fallback="media")
 
 
@@ -1260,6 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not segments:
             raise SystemExit(f"No valid subtitle cues were found in: {local_path}")
+        metadata.duration = segments[-1].end
         transcription_info = {"source": "local-subtitle", "model": None}
         audio_path: Path | None = None
     else:
@@ -1317,8 +1494,15 @@ def main(argv: list[str] | None = None) -> int:
                     except OSError as exc:
                         log(f"Could not remove downloaded audio: {exc}")
 
-    output_dir = settings.output_dir / safe_filename(metadata.title)
+    segments = normalize_segments(segments)
+    if not segments:
+        raise RuntimeError("No valid transcript segments were produced")
+
+    output_dir = choose_output_directory(settings.output_dir, metadata)
     log(f"Writing transcript to: {output_dir}")
+    write_output_manifest(output_dir, metadata, "in_progress")
+    summary_path = output_dir / "summary.md"
+    summary_path.unlink(missing_ok=True)
     write_transcript_outputs(output_dir, metadata, segments, transcription_info)
 
     if settings.llm_api_key and settings.llm_model:
@@ -1331,13 +1515,15 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log("Generating local structured summary")
         summary = summarize_locally(metadata, segments)
-    atomic_write_text(output_dir / "summary.md", summary)
+    atomic_write_text(summary_path, summary)
+    write_output_manifest(output_dir, metadata, "completed")
 
 
     print("\nExtraction completed")
     print(f"Summary:   {output_dir / 'summary.md'}")
     print(f"Transcript:{output_dir / 'transcript.txt'}")
     print(f"SRT:       {output_dir / 'transcript.srt'}")
+    print(f"VTT:       {output_dir / 'transcript.vtt'}")
     print(f"JSON:      {output_dir / 'transcript.json'}")
     return 0
 
